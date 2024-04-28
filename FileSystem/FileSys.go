@@ -3,6 +3,8 @@ package FileSystem
 import (
 	"bytes"
 	"encoding/gob"
+	"errors"
+	"fmt"
 	"log"
 	"strings"
 	"time"
@@ -35,6 +37,8 @@ type SuperBlock struct {
 	DataBlockStart   int //the block number of the beginning of the datablocks
 }
 
+var RootInode *INode
+
 type INode struct {
 	IsValid        bool //true if this inode is a real file
 	IsDirectory    bool //true if this file is actually a directory entry
@@ -45,6 +49,8 @@ type INode struct {
 	IndirectBlock  int
 	CreateTime     int64
 	LastModifyTime int64
+	DirectBlocks   []int
+	Children       map[string]*INode
 }
 
 type DirectoryEntry struct {
@@ -65,8 +71,8 @@ const (
 
 func InitializeFileSystem() {
 	//explicitly zero the filesystem - this shouldn't be needed
-	for blockLoc, _ := range Disk {
-		for byteLoc, _ := range Disk[blockLoc] {
+	for blockLoc := range Disk {
+		for byteLoc := range Disk[blockLoc] {
 			Disk[blockLoc][byteLoc] = 0
 		}
 	}
@@ -309,7 +315,7 @@ func createNewInode(sBlock SuperBlock) (INode, int) {
 	if freeInodeLoc >= 511 {
 		log.Fatal("All out of Inodes") //in a real file system I would return the 0/invalid inode
 	}
-	writeInodeBitmapToDisk(inodeBitmap, sBlock) //let's write it back with our new inode claimed
+	writeInodeBitmapToDisk(inodeBitmap, sBlock) 
 	newInode := INode{
 		IsValid:        true,
 		IsDirectory:    false,
@@ -327,13 +333,13 @@ func createNewInode(sBlock SuperBlock) (INode, int) {
 
 func writeInodeToDisk(inode *INode, InodeNum int, sblock SuperBlock) {
 	InodeAsBytes := EncodeToBytes(inode)
-	InodeBlock := InodeNum / (BLOCK_SIZE / INODE_SIZE) //once again this is floor integer division
+	InodeBlock := InodeNum / (BLOCK_SIZE / INODE_SIZE) 
 	InodeLocInBlock := InodeNum % (BLOCK_SIZE / INODE_SIZE)
 	copy(Disk[sblock.INodeStart+InodeBlock][INODE_SIZE*InodeLocInBlock:INODE_SIZE*InodeLocInBlock+INODE_SIZE], InodeAsBytes)
 }
 
 func getInodeFromDisk(inodeNum int) INode {
-	INodeBlock := inodeNum / (BLOCK_SIZE / INODE_SIZE) //there are 4 inodes per block, again int/floor division
+	INodeBlock := inodeNum / (BLOCK_SIZE / INODE_SIZE)
 	InodeOffset := inodeNum % (BLOCK_SIZE / INODE_SIZE)
 	sblock := ReadSuperBlock()
 	InodeFromDisk := INode{}
@@ -346,65 +352,86 @@ func getInodeFromDisk(inodeNum int) INode {
 	return InodeFromDisk
 }
 
-func Unlink(inodeNumToDelete int, parentDir INode) {
-	BlockWhereWeFindDirectoryEntry := parentDir.DirectBlock1 //I'm going to cheat here and only check direct block one since we would need more than 30 files otherwise
-	DirectoryBlockBytes := Disk[BlockWhereWeFindDirectoryEntry]
+func Unlink(inodeNumToDelete int, parentDir INode) error {
+	blockWhereDirectoryEntryIsFound := parentDir.DirectBlock1
+	directoryBlockBytes := Disk[blockWhereDirectoryEntryIsFound]
 	directoryEntryBlock := DirectoryBlock{}
-	decoder := gob.NewDecoder(bytes.NewReader(DirectoryBlockBytes[:]))
-	err := decoder.Decode(&directoryEntryBlock)
-	if err != nil {
-		log.Fatal("Error decoding Directory block: ", err)
+	decoder := gob.NewDecoder(bytes.NewReader(directoryBlockBytes[:]))
+
+	if err := decoder.Decode(&directoryEntryBlock); err != nil {
+		return fmt.Errorf("error decoding directory block: %w", err)
 	}
-	validDirectoryEntries := 0
-	for _, entry := range directoryEntryBlock {
+
+	// Attempt to find and clear the inode entry
+	found := false
+	for i, entry := range directoryEntryBlock {
 		if entry.Inode == inodeNumToDelete {
-			directoryEntryBlock[validDirectoryEntries] = DirectoryEntry{} //put empty one here
-			inodeBitmap := ReadINodeBitmap(ReadSuperBlock())
-			inodeBitmap[entry.Inode] = false
-			writeInodeBitmapToDisk(inodeBitmap, ReadSuperBlock())
-			inodeStruct := getInodeFromDisk(entry.Inode)
-			inodeStruct.IsValid = false
-			writeInodeToDisk(&inodeStruct, entry.Inode, ReadSuperBlock())
-			//now write directory structure back out to disk
-			currentDirectoryBlockBytes := EncodeToBytes(directoryEntryBlock)
-			copy(Disk[parentDir.DirectBlock1][:], currentDirectoryBlockBytes)
-			return
+			directoryEntryBlock[i] = DirectoryEntry{}
+			found = true
+			break
 		}
-		validDirectoryEntries++
 	}
-	//if we got here then we tried to delete a file not in this directory
-	log.Fatal("Tried to delete file not in folder")
+
+	if !found {
+		return fmt.Errorf("inode %d not found in directory", inodeNumToDelete)
+	}
+
+	// Update the inode bitmap and inode structure
+	inodeBitmap := ReadINodeBitmap(ReadSuperBlock())
+	inodeBitmap[inodeNumToDelete] = false
+	writeInodeBitmapToDisk(inodeBitmap, ReadSuperBlock())
+
+	inodeStruct := getInodeFromDisk(inodeNumToDelete)
+	inodeStruct.IsValid = false
+	writeInodeToDisk(&inodeStruct, inodeNumToDelete, ReadSuperBlock())
+
+	// Write the updated directory block back to disk
+	updatedDirectoryBlockBytes := EncodeToBytes(directoryEntryBlock)
+	copy(Disk[blockWhereDirectoryEntryIsFound][:], updatedDirectoryBlockBytes)
+
+	return nil
 }
 
-func Read(file *INode) string { //I told some of you who asked that you can assume all text files, so I'll return a string
+func Read(file *INode) string {
 	if !file.IsValid || file.IsDirectory {
-		return "" //maybe we should error, but I'll just return nothing
+		fmt.Println("File is invalid or a directory")
+		return ""
 	}
-	//I'm going to use string.Builder - which I didn't introduce in your class, but you can use + and it will be less efficient but will work
 	fileContents := strings.Builder{}
+	fmt.Printf("Reading direct block 1: %d\n", file.DirectBlock1)
 	firstBlock := Disk[file.DirectBlock1]
 	fileContents.Write(firstBlock[:])
+	fmt.Printf("Content from block 1: '%s'\n", string(firstBlock[:]))
+
 	if file.DirectBlock2 == 0 {
 		return fileContents.String()
 	}
+	fmt.Printf("Reading direct block 2: %d\n", file.DirectBlock2)
 	secondBlock := Disk[file.DirectBlock2]
 	fileContents.Write(secondBlock[:])
+	fmt.Printf("Content from block 2: '%s'\n", string(secondBlock[:]))
+
 	if file.DirectBlock3 == 0 {
 		return fileContents.String()
 	}
+	fmt.Printf("Reading direct block 3: %d\n", file.DirectBlock3)
 	thirdBlock := Disk[file.DirectBlock3]
 	fileContents.Write(thirdBlock[:])
+	fmt.Printf("Content from block 3: '%s'\n", string(thirdBlock[:]))
+
 	if file.IndirectBlock == 0 {
 		return fileContents.String()
 	}
-	//now things get more complicated, we need to read from the indirect block
+	fmt.Printf("Reading from indirect block: %d\n", file.IndirectBlock)
 	indirectBlockVal := getIndirectBlock(file)
-	for _, blockNum := range indirectBlockVal {
+	for i, blockNum := range indirectBlockVal {
 		if blockNum == 0 {
 			break
-		} else {
-			fileContents.Write(Disk[blockNum][:])
 		}
+		fmt.Printf("Reading indirect block number %d: %d\n", i+1, blockNum)
+		blockData := Disk[blockNum][:]
+		fileContents.Write(blockData)
+		fmt.Printf("Content from indirect block %d: '%s'\n", i+1, string(blockData))
 	}
 	return fileContents.String()
 }
@@ -455,7 +482,7 @@ func Write(file *INode, inodeNum int, content []byte) {
 					if block >= numCompleteBlocks {
 						break
 					}
-				} else { //at this point we are appending to the file, we need to allocate blocks that we write to
+				} else {
 					newBlock := allocateNewBlock(ReadSuperBlock())
 					indirectBlockVal[indirectBlockNum] = newBlock
 					//write the actual data to disk
@@ -463,9 +490,7 @@ func Write(file *INode, inodeNum int, content []byte) {
 					block++
 				}
 			}
-			//if we wrote anything to indirect blocks, then write the indirect block block again just incase
 			indirectBlockBytes := EncodeToBytes(indirectBlockVal)
-			//write the indirect block to disk
 			copy(Disk[file.IndirectBlock][:], indirectBlockBytes)
 		}
 	}
@@ -482,7 +507,7 @@ func Write(file *INode, inodeNum int, content []byte) {
 			copy(Disk[file.DirectBlock3][:], leftovers)
 		} else {
 			indirectBlockVal := getIndirectBlock(file)
-			finalBlockLoc := indirectBlockVal[numCompleteBlocks-3] //minus 3 for the three direct blocks
+			finalBlockLoc := indirectBlockVal[numCompleteBlocks-3] 
 			if finalBlockLoc != 0 {
 				copy(Disk[finalBlockLoc][:], leftovers)
 			} else {
@@ -502,11 +527,11 @@ func Write(file *INode, inodeNum int, content []byte) {
 // returns location of newly allocated block
 func allocateNewBlock(sblock SuperBlock) int {
 	freeBlockBitmap := ReadFreeBlockBitmap(sblock)
-	blockNum := RootFolder.DirectBlock1 //lets start after the first direct block
+	blockNum := RootFolder.DirectBlock1 
 	for bitblock, bitmapBlock := range freeBlockBitmap {
 		for locInBlock, bit := range bitmapBlock {
 			if bitblock == 0 && locInBlock <= blockNum {
-				continue //skip till we get to one in a valid area
+				continue 
 			}
 			if !bit {
 				//this bit is available
@@ -532,7 +557,7 @@ func getIndirectBlock(file *INode) IndirectBlock {
 	indirectBlockVal := IndirectBlock{}
 	decoder := gob.NewDecoder(bytes.NewReader(indirectBlockBytes[:]))
 	err := decoder.Decode(&indirectBlockVal)
-	if err != nil { //the better blue screen came from jetbrains AI
+	if err != nil { 
 		log.Fatal("Error decoding IndirectBlock from disk - better blue Screen", err)
 	}
 	return indirectBlockVal
@@ -541,19 +566,75 @@ func getIndirectBlock(file *INode) IndirectBlock {
 func getIndirectBlockFromDisk(indirectBlockNum int) [1024]byte {
 	return Disk[indirectBlockNum]
 }
-func GetParentAndChildInodes(path string) (parentINode INode, childINode INode, parentINodeNum int, childINodeNum int, err error) {
-	// Simulate finding inodes based on a path.
-	// This is purely illustrative; your actual implementation should properly parse and resolve the path.
-	parts := strings.Split(strings.Trim(path, "/"), "/")
-	if len(parts) == 0 {
-		return INode{}, INode{}, 0, 0, nil
+
+func DecodeDirectoryBlock(blockNum int) (DirectoryBlock, error) {
+	if blockNum < 0 || blockNum >= len(Disk) {
+		return DirectoryBlock{}, fmt.Errorf("block number %d out of range", blockNum)
 	}
 
-	// Simulating inode numbers and structs.
-	parentINode = INode{IsValid: true, IsDirectory: true, DirectBlock1: 1}
-	childINode = INode{IsValid: true, IsDirectory: false, DirectBlock1: 2}
-	parentINodeNum = 1
-	childINodeNum = 2
+	blockData := Disk[blockNum][:]
+	var dirBlock DirectoryBlock
+	decoder := gob.NewDecoder(bytes.NewReader(blockData))
+	if err := decoder.Decode(&dirBlock); err != nil {
+		return DirectoryBlock{}, fmt.Errorf("error decoding directory block: %w", err)
+	}
 
-	return parentINode, childINode, parentINodeNum, childINodeNum, nil
+	return dirBlock, nil
+}
+func GetINodeDetails(path string) (inode INode, inodeNum int, err error) {
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) == 0 {
+		return INode{}, 0, fmt.Errorf("invalid path")
+	}
+
+	
+	inode = INode{IsValid: true, IsDirectory: false, DirectBlock1: 1} // Simulated inode data
+	inodeNum = 1                                                      // Simulated inode number
+
+	return inode, inodeNum, nil
+}
+
+func FindSubdirectories(dir string) (INode, int) {
+	stringSlice := strings.Split(dir, "/")
+	parentNode := RootFolder
+	parentNodeNum := 0
+	for _, str := range stringSlice {
+		parentNode, parentNodeNum = Open(READ, str, parentNode)
+		if parentNodeNum == 0 {
+			log.Fatal("Location not found")
+			return INode{}, 0
+		}
+	}
+	return parentNode, parentNodeNum
+}
+func GetInodeFromPath(path string) (*INode, error) {
+	fmt.Println("Path:", path) // Print the path
+	if path == "" {
+		return RootInode, nil
+	}
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) == 0 {
+		return nil, errors.New("invalid path")
+	}
+
+	// Start at the root directory
+	currentInode := RootInode
+
+	// Traverse the path
+	for _, part := range parts {
+		fmt.Println("Part:", part) // Print the part
+		if !currentInode.IsDirectory {
+			return nil, errors.New("not a directory: " + part)
+		}
+
+		// Look up the next part in the current directory
+		nextInode, ok := currentInode.Children[part]
+		if !ok {
+			return nil, errors.New("no such file or directory: " + part)
+		}
+
+		currentInode = nextInode
+	}
+
+	return currentInode, nil
 }
